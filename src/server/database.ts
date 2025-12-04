@@ -1,16 +1,17 @@
 /**
- * PostgreSQL Database Module - Neon Serverless
+ * Database Module - Hybrid Storage (PostgreSQL + In-Memory Fallback)
  * 
- * This module connects to your Neon PostgreSQL database for persistent storage.
- * All predictions and history are now stored permanently and shared globally.
+ * This module provides database storage with automatic fallback:
+ * - ✅ PostgreSQL when DATABASE_URL is set (persistent, multi-user)
+ * - ✅ In-memory storage as fallback (temporary, single-instance)
  * 
- * Features:
- * - ✅ Persistent data (survives server restarts)
- * - ✅ Global predictions (same data across all browsers)
- * - ✅ Automatic evaluation and statistics
- * - ✅ Serverless connection pooling
+ * Environment Variables:
+ * - DATABASE_URL: PostgreSQL connection string (Neon, Vercel, etc.)
  * 
- * IMPORTANT: This uses pg-pool compatible approach for Deno
+ * On Vercel deployment:
+ * 1. Set DATABASE_URL in Vercel dashboard (Settings → Environment Variables)
+ * 2. Run SQL schema from docs/DATABASE_SETUP.md in Neon console
+ * 3. Deploy - database will work automatically!
  */
 
 import {
@@ -23,101 +24,51 @@ import type { z } from "zod";
 
 type SavePredictionRequest = z.infer<typeof SavePredictionRequestSchema>;
 
-// In-memory fallback storage
+// In-memory storage (fallback)
 const inMemoryPredictions: Map<string, PredictionEntry> = new Map();
 const inMemoryHistory: Map<string, PredictionHistoryEntry> = new Map();
 
+// PostgreSQL client (initialized if DATABASE_URL exists)
+let pgPool: any = null;
+
 /**
- * Simple PostgreSQL query execution using fetch
- * Works with Neon's serverless driver
+ * Initialize PostgreSQL connection if DATABASE_URL is set
  */
-async function query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
-  const DATABASE_URL = process.env.DATABASE_URL;
-  
-  if (!DATABASE_URL) {
-    console.warn('[Database] DATABASE_URL not set - using in-memory storage');
-    throw new Error('DATABASE_URL not configured');
+async function initPostgres() {
+  if (!process.env.DATABASE_URL) {
+    console.log('[Database] 💾 Using in-memory storage (data will reset on restart)');
+    console.log('[Database] ℹ️  To enable persistent storage: Set DATABASE_URL in Vercel dashboard');
+    return false;
   }
 
   try {
-    // Extract connection details
-    const url = new URL(DATABASE_URL);
+    // Dynamically import pg module (only available in Node.js/Vercel, not Deno)
+    const { Pool } = await import('pg');
     
-    // For Neon, we can use their serverless driver endpoint
-    // Format: https://console.neon.tech/api/v2/projects/{project_id}/branches/{branch_id}/databases/{database_id}/query
-    
-    // Simple approach: Use node-postgres compatible query
-    // Since we're in Deno, we'll use a different approach
-    
-    // Import postgres for Deno (compatible with Neon)
-    const response = await fetch('https://neon.tech/api/v2/query', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.NEON_API_KEY || ''}`,
-      },
-      body: JSON.stringify({
-        connectionString: DATABASE_URL,
-        query: sql,
-        params,
-      }),
+    pgPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 10, // Max connections
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
     });
 
-    if (!response.ok) {
-      throw new Error(`Query failed: ${response.statusText}`);
-    }
-
-    const result = await response.json();
-    return result.rows || [];
+    // Test connection
+    await pgPool.query('SELECT NOW()');
+    console.log('[Database] ✅ Connected to PostgreSQL database');
+    return true;
   } catch (error) {
-    console.error('[Database] Query error:', error);
-    throw error;
+    console.error('[Database] ⚠️  PostgreSQL connection failed, using in-memory fallback:', error);
+    pgPool = null;
+    return false;
   }
 }
 
-/**
- * Execute raw SQL with connection pooling
- * This is a simplified version that works in Deno runtime
- */
-async function executeSQL<T = any>(sql: string, params: any[] = []): Promise<T[]> {
-  const DATABASE_URL = process.env.DATABASE_URL;
-  
-  if (!DATABASE_URL) {
-    throw new Error('DATABASE_URL not configured');
-  }
-
-  try {
-    // Parse PostgreSQL connection string
-    const dbUrl = new URL(DATABASE_URL);
-    const host = dbUrl.hostname;
-    const port = dbUrl.port || '5432';
-    const database = dbUrl.pathname.slice(1);
-    const username = dbUrl.username;
-    const password = dbUrl.password;
-    const sslMode = dbUrl.searchParams.get('sslmode');
-
-    // Use native fetch with Neon's pooler endpoint
-    // Neon format: postgres://user:pass@ep-xxx.region.aws.neon.tech/dbname?sslmode=require
-    
-    // For now, we'll use a WebSocket-based connection compatible with Deno
-    // Import the postgres library dynamically
-    const { default: postgres } = await import('https://deno.land/x/postgres@v0.17.0/mod.ts');
-    
-    const client = new postgres(`${DATABASE_URL}`);
-    
-    const result = await client.queryObject(sql, params);
-    await client.end();
-    
-    return result.rows as T[];
-  } catch (error) {
-    console.error('[Database] SQL execution error:', error);
-    throw error;
-  }
-}
+// Initialize on module load
+const dbInitPromise = initPostgres();
 
 /**
- * Database interface
- * All database operations go through this interface
+ * Database interface - works with both PostgreSQL and in-memory storage
  */
 export const db = {
   /**
@@ -125,47 +76,49 @@ export const db = {
    * @returns Array of latest predictions
    */
   async getLatestPredictions(): Promise<PredictionEntry[]> {
-    if (!process.env.DATABASE_URL) {
-      console.log('[Database] Using in-memory storage:', inMemoryPredictions.size, 'predictions');
-      return Array.from(inMemoryPredictions.values());
+    await dbInitPromise; // Ensure initialization is complete
+
+    if (pgPool) {
+      try {
+        const result = await pgPool.query(`
+          SELECT DISTINCT ON (coin_id) 
+            id, coin_id, coin_name, coin_symbol, prediction, sentiment,
+            confidence, predicted_price, target_price, stop_loss, leverage,
+            risk_level, timeframe, analysis, reasons, indicators, created_at
+          FROM predictions
+          ORDER BY coin_id, created_at DESC
+        `);
+        
+        const predictions = result.rows.map((row: any) => ({
+          id: row.id,
+          coinId: row.coin_id,
+          coinName: row.coin_name,
+          coinSymbol: row.coin_symbol,
+          prediction: row.prediction,
+          sentiment: row.sentiment,
+          confidence: row.confidence,
+          predictedPrice: row.predicted_price,
+          targetPrice: row.target_price,
+          stopLoss: row.stop_loss,
+          leverage: row.leverage,
+          riskLevel: row.risk_level,
+          timeframe: row.timeframe,
+          analysis: row.analysis,
+          reasons: JSON.parse(row.reasons),
+          indicators: JSON.parse(row.indicators),
+          createdAt: row.created_at,
+        }));
+        
+        console.log(`[Database] 📊 Fetched ${predictions.length} predictions from PostgreSQL`);
+        return predictions;
+      } catch (error) {
+        console.error('[Database] ⚠️  PostgreSQL query failed, using in-memory data:', error);
+      }
     }
 
-    try {
-      const rows = await executeSQL<any>(`
-        SELECT DISTINCT ON (coin_id)
-          id,
-          coin_id as "coinId",
-          coin_name as "coinName",
-          coin_symbol as "coinSymbol",
-          prediction,
-          sentiment,
-          confidence,
-          predicted_price as "predictedPrice",
-          target_price as "targetPrice",
-          stop_loss as "stopLoss",
-          leverage,
-          risk_level as "riskLevel",
-          timeframe,
-          analysis,
-          reasons,
-          indicators,
-          created_at as "createdAt"
-        FROM predictions
-        ORDER BY coin_id, created_at DESC
-        LIMIT 100
-      `);
-
-      console.log(`[Database] Fetched ${rows.length} predictions from PostgreSQL`);
-
-      return rows.map(row => ({
-        ...row,
-        reasons: typeof row.reasons === 'string' ? JSON.parse(row.reasons) : row.reasons,
-        indicators: typeof row.indicators === 'string' ? JSON.parse(row.indicators) : row.indicators,
-      }));
-    } catch (error) {
-      console.error('[Database] Error fetching predictions, using in-memory fallback:', error);
-      return Array.from(inMemoryPredictions.values());
-    }
+    // Fallback to in-memory
+    console.log(`[Database] 💾 Fetched ${inMemoryPredictions.size} predictions from in-memory storage`);
+    return Array.from(inMemoryPredictions.values());
   },
 
   /**
@@ -178,59 +131,51 @@ export const db = {
     coinId: string,
     maxAge: number
   ): Promise<PredictionEntry | null> {
-    if (!process.env.DATABASE_URL) {
-      const pred = inMemoryPredictions.get(coinId);
-      if (!pred) return null;
-      
-      const age = Date.now() - pred.createdAt;
-      return age <= maxAge ? pred : null;
-    }
+    await dbInitPromise;
 
-    try {
-      const cutoff = Date.now() - maxAge;
-      
-      const rows = await executeSQL<any>(
-        `
-          SELECT
-            id,
-            coin_id as "coinId",
-            coin_name as "coinName",
-            coin_symbol as "coinSymbol",
-            prediction,
-            sentiment,
-            confidence,
-            predicted_price as "predictedPrice",
-            target_price as "targetPrice",
-            stop_loss as "stopLoss",
-            leverage,
-            risk_level as "riskLevel",
-            timeframe,
-            analysis,
-            reasons,
-            indicators,
-            created_at as "createdAt"
-          FROM predictions
-          WHERE coin_id = $1 AND created_at > $2
-          ORDER BY created_at DESC
-          LIMIT 1
-        `,
-        [coinId, cutoff]
-      );
-
-      if (rows.length === 0) {
-        return null;
+    if (pgPool) {
+      try {
+        const cutoff = Date.now() - maxAge;
+        const result = await pgPool.query(
+          `SELECT * FROM predictions 
+           WHERE coin_id = $1 AND created_at > $2 
+           ORDER BY created_at DESC LIMIT 1`,
+          [coinId, cutoff]
+        );
+        
+        if (result.rows.length === 0) return null;
+        
+        const row = result.rows[0];
+        return {
+          id: row.id,
+          coinId: row.coin_id,
+          coinName: row.coin_name,
+          coinSymbol: row.coin_symbol,
+          prediction: row.prediction,
+          sentiment: row.sentiment,
+          confidence: row.confidence,
+          predictedPrice: row.predicted_price,
+          targetPrice: row.target_price,
+          stopLoss: row.stop_loss,
+          leverage: row.leverage,
+          riskLevel: row.risk_level,
+          timeframe: row.timeframe,
+          analysis: row.analysis,
+          reasons: JSON.parse(row.reasons),
+          indicators: JSON.parse(row.indicators),
+          createdAt: row.created_at,
+        };
+      } catch (error) {
+        console.error('[Database] ⚠️  PostgreSQL query failed:', error);
       }
-
-      const row = rows[0];
-      return {
-        ...row,
-        reasons: typeof row.reasons === 'string' ? JSON.parse(row.reasons) : row.reasons,
-        indicators: typeof row.indicators === 'string' ? JSON.parse(row.indicators) : row.indicators,
-      };
-    } catch (error) {
-      console.error('[Database] Error fetching recent prediction:', error);
-      return null;
     }
+
+    // Fallback
+    const pred = inMemoryPredictions.get(coinId);
+    if (!pred) return null;
+    
+    const age = Date.now() - pred.createdAt;
+    return age <= maxAge ? pred : null;
   },
 
   /**
@@ -239,6 +184,8 @@ export const db = {
    * @returns Saved prediction
    */
   async savePrediction(data: SavePredictionRequest): Promise<PredictionEntry> {
+    await dbInitPromise;
+
     const id = `pred_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const now = Date.now();
 
@@ -248,6 +195,46 @@ export const db = {
       createdAt: now,
     };
 
+    if (pgPool) {
+      try {
+        // Save to predictions table
+        await pgPool.query(
+          `INSERT INTO predictions (
+            id, coin_id, coin_name, coin_symbol, prediction, sentiment,
+            confidence, predicted_price, target_price, stop_loss, leverage,
+            risk_level, timeframe, analysis, reasons, indicators, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+          [
+            id, data.coinId, data.coinName, data.coinSymbol, data.prediction,
+            data.sentiment, data.confidence, data.predictedPrice, data.targetPrice,
+            data.stopLoss, data.leverage, data.riskLevel, data.timeframe,
+            data.analysis, JSON.stringify(data.reasons), JSON.stringify(data.indicators),
+            now
+          ]
+        );
+
+        // Also insert into history
+        const historyId = `hist_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        await pgPool.query(
+          `INSERT INTO prediction_history (
+            id, prediction_id, coin_id, coin_name, coin_symbol, prediction,
+            confidence, predicted_price, target_price, stop_loss, timestamp, outcome
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')`,
+          [
+            historyId, id, data.coinId, data.coinName, data.coinSymbol,
+            data.prediction, data.confidence, data.predictedPrice,
+            data.targetPrice, data.stopLoss, now
+          ]
+        );
+
+        console.log(`[Database] ✅ Saved prediction ${id} (${data.coinSymbol}) to PostgreSQL`);
+        return predictionEntry;
+      } catch (error) {
+        console.error('[Database] ⚠️  PostgreSQL save failed, using in-memory:', error);
+      }
+    }
+
+    // Fallback to in-memory
     const historyId = `hist_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
     const historyEntry: PredictionHistoryEntry = {
@@ -268,81 +255,10 @@ export const db = {
       profitLoss: null,
     };
 
-    // Try database first
-    if (process.env.DATABASE_URL) {
-      try {
-        await executeSQL(
-          `
-            INSERT INTO predictions (
-              id, coin_id, coin_name, coin_symbol, prediction, sentiment,
-              confidence, predicted_price, target_price, stop_loss,
-              leverage, risk_level, timeframe, analysis, reasons, indicators, created_at
-            ) VALUES (
-              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
-            )
-          `,
-          [
-            id,
-            data.coinId,
-            data.coinName,
-            data.coinSymbol,
-            data.prediction,
-            data.sentiment,
-            data.confidence,
-            data.predictedPrice,
-            data.targetPrice,
-            data.stopLoss,
-            data.leverage,
-            data.riskLevel,
-            data.timeframe,
-            data.analysis,
-            JSON.stringify(data.reasons),
-            JSON.stringify(data.indicators),
-            now,
-          ]
-        );
-
-        await executeSQL(
-          `
-            INSERT INTO prediction_history (
-              id, prediction_id, coin_id, coin_name, coin_symbol,
-              prediction, confidence, predicted_price, target_price,
-              stop_loss, actual_price, timestamp, evaluated_at, outcome, profit_loss
-            ) VALUES (
-              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
-            )
-          `,
-          [
-            historyId,
-            id,
-            data.coinId,
-            data.coinName,
-            data.coinSymbol,
-            data.prediction,
-            data.confidence,
-            data.predictedPrice,
-            data.targetPrice,
-            data.stopLoss,
-            null,
-            now,
-            null,
-            'pending',
-            null,
-          ]
-        );
-
-        console.log(`[Database] ✅ Saved prediction ${id} to PostgreSQL`);
-        return predictionEntry;
-      } catch (error) {
-        console.error('[Database] ❌ PostgreSQL save failed:', error);
-        console.error('[Database] Error details:', JSON.stringify(error, null, 2));
-      }
-    }
-
-    // Fallback to in-memory storage
-    console.log(`[Database] 💾 Saving prediction ${id} to in-memory storage`);
     inMemoryPredictions.set(data.coinId, predictionEntry);
     inMemoryHistory.set(historyId, historyEntry);
+    
+    console.log(`[Database] 💾 Saved prediction ${id} (${data.coinSymbol}) to in-memory storage`);
     
     return predictionEntry;
   },
@@ -357,53 +273,52 @@ export const db = {
     days: number = 7,
     limit: number = 100
   ): Promise<PredictionHistoryEntry[]> {
-    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
+    await dbInitPromise;
 
-    // Try database first
-    if (process.env.DATABASE_URL) {
+    if (pgPool) {
       try {
-        const rows = await executeSQL<any>(
-          `
-            SELECT
-              id,
-              prediction_id as "predictionId",
-              coin_id as "coinId",
-              coin_name as "coinName",
-              coin_symbol as "coinSymbol",
-              prediction,
-              confidence,
-              predicted_price as "predictedPrice",
-              target_price as "targetPrice",
-              stop_loss as "stopLoss",
-              actual_price as "actualPrice",
-              timestamp,
-              evaluated_at as "evaluatedAt",
-              outcome,
-              profit_loss as "profitLoss"
-            FROM prediction_history
-            WHERE timestamp > $1
-            ORDER BY timestamp DESC
-            LIMIT $2
-          `,
+        const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
+        const result = await pgPool.query(
+          `SELECT * FROM prediction_history 
+           WHERE timestamp > $1 
+           ORDER BY timestamp DESC 
+           LIMIT $2`,
           [cutoff, limit]
         );
 
-        if (rows.length > 0) {
-          console.log(`[Database] ✅ Fetched ${rows.length} history entries from PostgreSQL`);
-          return rows;
-        }
+        const entries = result.rows.map((row: any) => ({
+          id: row.id,
+          predictionId: row.prediction_id,
+          coinId: row.coin_id,
+          coinName: row.coin_name,
+          coinSymbol: row.coin_symbol,
+          prediction: row.prediction,
+          confidence: row.confidence,
+          predictedPrice: row.predicted_price,
+          targetPrice: row.target_price,
+          stopLoss: row.stop_loss,
+          actualPrice: row.actual_price,
+          timestamp: row.timestamp,
+          evaluatedAt: row.evaluated_at,
+          outcome: row.outcome,
+          profitLoss: row.profit_loss,
+        }));
+
+        console.log(`[Database] 📊 Fetched ${entries.length} history entries from PostgreSQL`);
+        return entries;
       } catch (error) {
-        console.error('[Database] ❌ PostgreSQL fetch failed:', error);
+        console.error('[Database] ⚠️  PostgreSQL query failed:', error);
       }
     }
 
-    // Fallback to in-memory storage
-    console.log(`[Database] 💾 Using in-memory history (${inMemoryHistory.size} entries)`);
+    // Fallback
+    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
     const entries = Array.from(inMemoryHistory.values())
       .filter(e => e.timestamp > cutoff)
       .sort((a, b) => b.timestamp - a.timestamp)
       .slice(0, limit);
     
+    console.log(`[Database] 💾 Fetched ${entries.length} history entries from in-memory storage`);
     return entries;
   },
 
@@ -412,38 +327,38 @@ export const db = {
    * @returns Array of pending history entries
    */
   async getPendingPredictions(): Promise<PredictionHistoryEntry[]> {
-    if (!process.env.DATABASE_URL) {
-      return Array.from(inMemoryHistory.values()).filter(e => e.outcome === 'pending');
+    await dbInitPromise;
+
+    if (pgPool) {
+      try {
+        const result = await pgPool.query(
+          `SELECT * FROM prediction_history WHERE outcome = 'pending' ORDER BY timestamp DESC`
+        );
+
+        return result.rows.map((row: any) => ({
+          id: row.id,
+          predictionId: row.prediction_id,
+          coinId: row.coin_id,
+          coinName: row.coin_name,
+          coinSymbol: row.coin_symbol,
+          prediction: row.prediction,
+          confidence: row.confidence,
+          predictedPrice: row.predicted_price,
+          targetPrice: row.target_price,
+          stopLoss: row.stop_loss,
+          actualPrice: row.actual_price,
+          timestamp: row.timestamp,
+          evaluatedAt: row.evaluated_at,
+          outcome: row.outcome,
+          profitLoss: row.profit_loss,
+        }));
+      } catch (error) {
+        console.error('[Database] ⚠️  PostgreSQL query failed:', error);
+      }
     }
 
-    try {
-      const rows = await executeSQL<any>(`
-        SELECT
-          id,
-          prediction_id as "predictionId",
-          coin_id as "coinId",
-          coin_name as "coinName",
-          coin_symbol as "coinSymbol",
-          prediction,
-          confidence,
-          predicted_price as "predictedPrice",
-          target_price as "targetPrice",
-          stop_loss as "stopLoss",
-          actual_price as "actualPrice",
-          timestamp,
-          evaluated_at as "evaluatedAt",
-          outcome,
-          profit_loss as "profitLoss"
-        FROM prediction_history
-        WHERE outcome = 'pending'
-        ORDER BY timestamp DESC
-      `);
-
-      return rows;
-    } catch (error) {
-      console.error('[Database] Error fetching pending predictions:', error);
-      return [];
-    }
+    // Fallback
+    return Array.from(inMemoryHistory.values()).filter(e => e.outcome === 'pending');
   },
 
   /**
@@ -461,33 +376,33 @@ export const db = {
     profitLoss: number,
     evaluatedAt: number
   ): Promise<void> {
-    if (!process.env.DATABASE_URL) {
-      const entry = inMemoryHistory.get(id);
-      if (entry) {
-        entry.actualPrice = actualPrice;
-        entry.outcome = outcome;
-        entry.profitLoss = profitLoss;
-        entry.evaluatedAt = evaluatedAt;
+    await dbInitPromise;
+
+    if (pgPool) {
+      try {
+        await pgPool.query(
+          `UPDATE prediction_history 
+           SET actual_price = $1, outcome = $2, profit_loss = $3, evaluated_at = $4 
+           WHERE id = $5`,
+          [actualPrice, outcome, profitLoss, evaluatedAt, id]
+        );
+        
+        console.log(`[Database] ✅ Evaluated prediction ${id}: ${outcome} (${profitLoss.toFixed(2)}%)`);
+        return;
+      } catch (error) {
+        console.error('[Database] ⚠️  PostgreSQL update failed:', error);
       }
-      return;
     }
 
-    try {
-      await executeSQL(
-        `
-          UPDATE prediction_history
-          SET
-            actual_price = $2,
-            outcome = $3,
-            profit_loss = $4,
-            evaluated_at = $5
-          WHERE id = $1
-        `,
-        [id, actualPrice, outcome, profitLoss, evaluatedAt]
-      );
-    } catch (error) {
-      console.error('[Database] Error evaluating prediction:', error);
-      throw error;
+    // Fallback
+    const entry = inMemoryHistory.get(id);
+    if (entry) {
+      entry.actualPrice = actualPrice;
+      entry.outcome = outcome;
+      entry.profitLoss = profitLoss;
+      entry.evaluatedAt = evaluatedAt;
+      
+      console.log(`[Database] 💾 Evaluated prediction ${id}: ${outcome} (${profitLoss.toFixed(2)}%)`);
     }
   },
 
@@ -496,113 +411,69 @@ export const db = {
    * @returns Statistics object
    */
   async getPredictionStats(): Promise<PredictionStats> {
-    if (!process.env.DATABASE_URL) {
-      const entries = Array.from(inMemoryHistory.values());
-      const completed = entries.filter(e => e.outcome !== 'pending');
-      
-      const total = completed.length;
-      const wins = completed.filter(e => e.outcome === 'win').length;
-      const losses = completed.filter(e => e.outcome === 'loss').length;
-      const neutral = completed.filter(e => e.outcome === 'neutral').length;
-      
-      const avgProfit = completed.reduce((sum, e) => sum + (e.profitLoss || 0), 0) / (total || 1);
-      
-      const longPreds = completed.filter(e => e.prediction === 'LONG');
-      const shortPreds = completed.filter(e => e.prediction === 'SHORT');
-      
-      return {
-        total,
-        wins,
-        losses,
-        neutral,
-        winRate: total > 0 ? (wins / total) * 100 : 0,
-        avgProfit,
-        longWinRate: longPreds.length > 0 ? (longPreds.filter(e => e.outcome === 'win').length / longPreds.length) * 100 : 0,
-        shortWinRate: shortPreds.length > 0 ? (shortPreds.filter(e => e.outcome === 'win').length / shortPreds.length) * 100 : 0,
-        totalPending: entries.filter(e => e.outcome === 'pending').length,
-      };
+    await dbInitPromise;
+
+    if (pgPool) {
+      try {
+        const result = await pgPool.query(`
+          SELECT 
+            COUNT(*) FILTER (WHERE outcome != 'pending') as total,
+            COUNT(*) FILTER (WHERE outcome = 'win') as wins,
+            COUNT(*) FILTER (WHERE outcome = 'loss') as losses,
+            COUNT(*) FILTER (WHERE outcome = 'neutral') as neutral,
+            COUNT(*) FILTER (WHERE outcome = 'pending') as total_pending,
+            AVG(profit_loss) FILTER (WHERE outcome != 'pending') as avg_profit,
+            COUNT(*) FILTER (WHERE prediction = 'LONG' AND outcome = 'win')::float / 
+              NULLIF(COUNT(*) FILTER (WHERE prediction = 'LONG' AND outcome != 'pending'), 0) * 100 as long_win_rate,
+            COUNT(*) FILTER (WHERE prediction = 'SHORT' AND outcome = 'win')::float / 
+              NULLIF(COUNT(*) FILTER (WHERE prediction = 'SHORT' AND outcome != 'pending'), 0) * 100 as short_win_rate
+          FROM prediction_history
+        `);
+
+        const row = result.rows[0];
+        const total = parseInt(row.total) || 0;
+        const wins = parseInt(row.wins) || 0;
+
+        return {
+          total,
+          wins,
+          losses: parseInt(row.losses) || 0,
+          neutral: parseInt(row.neutral) || 0,
+          winRate: total > 0 ? (wins / total) * 100 : 0,
+          avgProfit: parseFloat(row.avg_profit) || 0,
+          longWinRate: parseFloat(row.long_win_rate) || 0,
+          shortWinRate: parseFloat(row.short_win_rate) || 0,
+          totalPending: parseInt(row.total_pending) || 0,
+        };
+      } catch (error) {
+        console.error('[Database] ⚠️  PostgreSQL stats query failed:', error);
+      }
     }
 
-    try {
-      const statsRows = await executeSQL<any>(`
-        SELECT
-          COUNT(*) as total,
-          SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
-          SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losses,
-          SUM(CASE WHEN outcome = 'neutral' THEN 1 ELSE 0 END) as neutral,
-          AVG(CASE WHEN outcome != 'pending' AND profit_loss IS NOT NULL THEN profit_loss ELSE 0 END) as avg_profit
-        FROM prediction_history
-        WHERE outcome != 'pending'
-      `);
-
-      const longRows = await executeSQL<any>(`
-        SELECT
-          COUNT(*) as total,
-          SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins
-        FROM prediction_history
-        WHERE prediction = 'LONG' AND outcome != 'pending'
-      `);
-
-      const shortRows = await executeSQL<any>(`
-        SELECT
-          COUNT(*) as total,
-          SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins
-        FROM prediction_history
-        WHERE prediction = 'SHORT' AND outcome != 'pending'
-      `);
-
-      const pendingRows = await executeSQL<any>(`
-        SELECT COUNT(*) as total
-        FROM prediction_history
-        WHERE outcome = 'pending'
-      `);
-
-      const stats = statsRows[0] || { total: 0, wins: 0, losses: 0, neutral: 0, avg_profit: 0 };
-      const longStats = longRows[0] || { total: 0, wins: 0 };
-      const shortStats = shortRows[0] || { total: 0, wins: 0 };
-      const pending = pendingRows[0] || { total: 0 };
-
-      const total = parseInt(stats.total) || 0;
-      const wins = parseInt(stats.wins) || 0;
-      const losses = parseInt(stats.losses) || 0;
-      const neutral = parseInt(stats.neutral) || 0;
-      const avgProfit = parseFloat(stats.avg_profit) || 0;
-
-      const longTotal = parseInt(longStats.total) || 0;
-      const longWins = parseInt(longStats.wins) || 0;
-      const shortTotal = parseInt(shortStats.total) || 0;
-      const shortWins = parseInt(shortStats.wins) || 0;
-
-      const winRate = total > 0 ? (wins / total) * 100 : 0;
-      const longWinRate = longTotal > 0 ? (longWins / longTotal) * 100 : 0;
-      const shortWinRate = shortTotal > 0 ? (shortWins / shortTotal) * 100 : 0;
-
-      console.log(`[Database] ✅ Stats: ${total} total, ${wins} wins, ${winRate.toFixed(1)}% win rate`);
-
-      return {
-        total,
-        wins,
-        losses,
-        neutral,
-        winRate,
-        avgProfit,
-        longWinRate,
-        shortWinRate,
-        totalPending: parseInt(pending.total) || 0,
-      };
-    } catch (error) {
-      console.error('[Database] Error fetching stats:', error);
-      return {
-        total: 0,
-        wins: 0,
-        losses: 0,
-        neutral: 0,
-        winRate: 0,
-        avgProfit: 0,
-        longWinRate: 0,
-        shortWinRate: 0,
-        totalPending: 0,
-      };
-    }
+    // Fallback
+    const entries = Array.from(inMemoryHistory.values());
+    const completed = entries.filter(e => e.outcome !== 'pending');
+    
+    const total = completed.length;
+    const wins = completed.filter(e => e.outcome === 'win').length;
+    const losses = completed.filter(e => e.outcome === 'loss').length;
+    const neutral = completed.filter(e => e.outcome === 'neutral').length;
+    
+    const avgProfit = completed.reduce((sum, e) => sum + (e.profitLoss || 0), 0) / (total || 1);
+    
+    const longPreds = completed.filter(e => e.prediction === 'LONG');
+    const shortPreds = completed.filter(e => e.prediction === 'SHORT');
+    
+    return {
+      total,
+      wins,
+      losses,
+      neutral,
+      winRate: total > 0 ? (wins / total) * 100 : 0,
+      avgProfit,
+      longWinRate: longPreds.length > 0 ? (longPreds.filter(e => e.outcome === 'win').length / longPreds.length) * 100 : 0,
+      shortWinRate: shortPreds.length > 0 ? (shortPreds.filter(e => e.outcome === 'win').length / shortPreds.length) * 100 : 0,
+      totalPending: entries.filter(e => e.outcome === 'pending').length,
+    };
   },
 };

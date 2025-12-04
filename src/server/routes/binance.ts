@@ -164,12 +164,27 @@ function binanceSymbolToCoinId(symbol: string): string {
 }
 
 /**
+ * Converts CoinGecko ID to Binance symbol
+ */
+function coinIdToBinanceSymbol(coinId: string): string | null {
+  // Check if we have a direct mapping
+  if (SYMBOL_MAP[coinId]) {
+    return SYMBOL_MAP[coinId];
+  }
+  
+  // Try uppercase + USDT
+  const symbol = coinId.toUpperCase() + 'USDT';
+  return symbol;
+}
+
+/**
  * Creates the Binance API proxy routes
  */
 export function createBinanceRoute() {
   console.log('[Binance Route] Creating Binance route...');
   
   const route = new Hono()
+    // Get top markets by volume
     .get("/markets", async (c) => {
       try {
         console.log('[Binance Route] /markets endpoint called');
@@ -229,6 +244,8 @@ export function createBinanceRoute() {
         }, 500);
       }
     })
+    
+    // Get global market stats
     .get("/global", async (c) => {
       try {
         console.log('[Binance Route] /global endpoint called');
@@ -265,6 +282,161 @@ export function createBinanceRoute() {
           error: 'Failed to fetch global data',
           message: error instanceof Error ? error.message : 'Unknown error',
           timestamp: new Date().toISOString()
+        }, 500);
+      }
+    })
+    
+    // Get specific coin data
+    .get("/coin/:id", async (c) => {
+      try {
+        const coinId = c.req.param('id');
+        console.log('[Binance Route] /coin/:id endpoint called for:', coinId);
+        
+        const binanceSymbol = coinIdToBinanceSymbol(coinId);
+        if (!binanceSymbol) {
+          return c.json({ error: 'Coin not found' }, 404);
+        }
+        
+        // Get ticker data
+        const ticker = await fetchFromBinance(`/ticker/24hr?symbol=${binanceSymbol}`);
+        
+        const symbol = binanceSymbol.replace('USDT', '');
+        
+        const transformed = {
+          id: coinId,
+          symbol: symbol.toLowerCase(),
+          name: symbol,
+          current_price: parseFloat(ticker.lastPrice),
+          market_cap: parseFloat(ticker.quoteVolume) * 365,
+          market_cap_rank: 0,
+          total_volume: parseFloat(ticker.quoteVolume),
+          price_change_percentage_24h: parseFloat(ticker.priceChangePercent),
+          price_change_percentage_7d_in_currency: null,
+          high_24h: parseFloat(ticker.highPrice),
+          low_24h: parseFloat(ticker.lowPrice),
+          ath: parseFloat(ticker.highPrice),
+          ath_change_percentage: parseFloat(ticker.priceChangePercent),
+          circulating_supply: null,
+          max_supply: null,
+          image: `https://assets.coincap.io/assets/icons/${symbol.toLowerCase()}@2x.png`,
+          last_updated: new Date(ticker.closeTime).toISOString(),
+        };
+        
+        console.log('[Binance Route] Successfully returned coin data for:', coinId);
+        return c.json(transformed);
+      } catch (error) {
+        console.error('[Binance Route] Error in /coin/:id:', error);
+        return c.json({ 
+          error: 'Failed to fetch coin data',
+          message: error instanceof Error ? error.message : 'Unknown error'
+        }, 500);
+      }
+    })
+    
+    // Search for coins
+    .get("/search", async (c) => {
+      try {
+        const query = c.req.query('query')?.toLowerCase() || '';
+        console.log('[Binance Route] /search endpoint called with query:', query);
+        
+        if (!query) {
+          return c.json({ coins: [] });
+        }
+        
+        // Get all tickers
+        const tickers = await fetchFromBinance('/ticker/24hr');
+        const usdtPairs = tickers.filter((t: any) => t.symbol.endsWith('USDT'));
+        
+        // Search by symbol
+        const matches = usdtPairs
+          .filter((t: any) => {
+            const symbol = t.symbol.replace('USDT', '').toLowerCase();
+            return symbol.includes(query);
+          })
+          .slice(0, 20)
+          .map((t: any, index: number) => {
+            const symbol = t.symbol.replace('USDT', '');
+            const coinId = binanceSymbolToCoinId(t.symbol);
+            
+            return {
+              id: coinId,
+              name: symbol,
+              symbol: symbol.toLowerCase(),
+              market_cap_rank: index + 1,
+              thumb: `https://assets.coincap.io/assets/icons/${symbol.toLowerCase()}@2x.png`,
+              large: `https://assets.coincap.io/assets/icons/${symbol.toLowerCase()}@2x.png`,
+            };
+          });
+        
+        console.log(`[Binance Route] Found ${matches.length} search results`);
+        return c.json({ coins: matches });
+      } catch (error) {
+        console.error('[Binance Route] Error in /search:', error);
+        return c.json({ 
+          error: 'Failed to search',
+          message: error instanceof Error ? error.message : 'Unknown error'
+        }, 500);
+      }
+    })
+    
+    // Get price history
+    .get("/price-history/:id", async (c) => {
+      try {
+        const coinId = c.req.param('id');
+        const days = parseInt(c.req.query('days') || '7');
+        console.log('[Binance Route] /price-history/:id endpoint called for:', coinId, 'days:', days);
+        
+        const binanceSymbol = coinIdToBinanceSymbol(coinId);
+        if (!binanceSymbol) {
+          return c.json({ error: 'Coin not found' }, 404);
+        }
+        
+        // Calculate interval based on days
+        let interval = '1h';
+        let limit = days * 24;
+        
+        if (days === 1) {
+          interval = '15m';
+          limit = 96;
+        } else if (days <= 7) {
+          interval = '1h';
+          limit = days * 24;
+        } else if (days <= 30) {
+          interval = '4h';
+          limit = days * 6;
+        } else if (days <= 90) {
+          interval = '1d';
+          limit = days;
+        } else {
+          interval = '1d';
+          limit = 365;
+        }
+        
+        // Get klines (candlestick data)
+        const klines = await fetchFromBinance(
+          `/klines?symbol=${binanceSymbol}&interval=${interval}&limit=${limit}`
+        );
+        
+        // Transform to price history format
+        const prices = klines.map((kline: any) => ({
+          timestamp: kline[0], // Open time
+          price: parseFloat(kline[4]) // Close price
+        }));
+        
+        const result = {
+          coinId,
+          prices,
+          market_caps: [],
+          total_volumes: []
+        };
+        
+        console.log('[Binance Route] Successfully returned price history for:', coinId);
+        return c.json(result);
+      } catch (error) {
+        console.error('[Binance Route] Error in /price-history/:id:', error);
+        return c.json({ 
+          error: 'Failed to fetch price history',
+          message: error instanceof Error ? error.message : 'Unknown error'
         }, 500);
       }
     });

@@ -15,7 +15,7 @@ import { Hono } from "hono";
  * API Documentation: https://binance-docs.github.io/apidocs/spot/en/
  */
 
-const BINANCE_API = 'https://api.binance.com/api/v3';
+const BINANCE_API = 'https://api1.binance.com/';
 
 // Simple in-memory cache with TTL
 interface CacheEntry {

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "rsbuild dev",
     "build": "rsbuild build -c rsbuild.config.ts && rsbuild build -c rsbuild.config.server.ts",
-    "vercel-build": "rsbuild build -c rsbuild.config.ts && rsbuild build -c rsbuild.config.server.ts",
+    "vercel-build": "rsbuild build -c rsbuild.config.ts && rsbuild build -c rsbuild.config.server.vercel.ts",
     "build:client": "rsbuild build -c rsbuild.config.ts",
     "build:server": "rsbuild build -c rsbuild.config.server.ts",
     "type-check": "tsc -b --pretty",

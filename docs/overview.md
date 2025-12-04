@@ -21,27 +21,31 @@ A professional cryptocurrency prediction platform with real-time price data and 
 - **Backtesting System**: Test strategies on historical data
 - **Advanced Filters**: Filter by risk, leverage, timeframe
 
-### 🌐 **NEW: Centralized Backend (Global Predictions & History)**
+### 🌐 **Centralized Backend (Global Predictions & History)**
 - ✅ **Same predictions on ALL browsers/devices**
-- ✅ **History persists across sessions**
+- ✅ **History persists across sessions** (with database)
 - ✅ **Automatic evaluation of pending predictions**
 - ✅ **Real-time statistics shared globally**
 - ✅ **Backend proxy for CoinGecko API (CORS-free)**
-- ⚠️ **Currently using in-memory storage** (data resets on server restart)
-- 📝 **Production requires database setup** (see below)
+- ✅ **Hybrid storage**: PostgreSQL (when deployed) + in-memory fallback
+- 🚀 **Ready for Vercel deployment** with Neon PostgreSQL
 
 ## Project Structure
 
 ### Documentation
 - `docs/prd.md`: Product requirements and specifications
-- `docs/todo.md`: Implementation task list (Phase 21 complete)
+- `docs/todo.md`: Implementation task list (Phase 22 complete)
 - `docs/overview.md`: This file - project architecture overview
 - `docs/DATABASE_SETUP.md`: Complete database setup guide
+- `VERCEL_DEPLOYMENT.md`: **NEW** - Step-by-step Vercel deployment guide
 
 ### Configuration Files
 - `tailwind.config.ts`: Tailwind CSS configuration with custom trading theme
 - `src/styles/globals.css`: Global styles with dark trading interface theme
 - `index.html`: HTML entry point with SEO metadata
+- `vercel.json`: **NEW** - Vercel deployment configuration
+- `api/index.js`: **NEW** - Vercel serverless function entry point
+- `.vercelignore`: **NEW** - Vercel build optimization
 
 ### Type Definitions
 - `src/types/crypto.ts`: Complete TypeScript interfaces for all data structures
@@ -81,7 +85,7 @@ A professional cryptocurrency prediction platform with real-time price data and 
   - ✅ Future-proof for API key management
 
 **Database & Routes**:
-- `src/server/database.ts`: **NEW** - Database interface (currently in-memory, needs real DB)
+- `src/server/database.ts`: **UPDATED** - Hybrid database with PostgreSQL + in-memory fallback
 - `src/server/schema.ts`: **UPDATED** - Added prediction and history schemas
 - `src/server/routes/index.ts`: **UPDATED** - Registered all routes (predictions + coingecko)
 - `src/server/routes/example.ts`: Example route (reference only)
